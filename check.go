@@ -8,6 +8,7 @@ package check
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -869,13 +870,18 @@ func (runner *suiteRunner) reportCallDone(c *C) {
 type outputWriter struct {
 	m                    sync.Mutex
 	writer               io.Writer
+	resWriter            io.Writer
 	wroteCallProblemLast bool
 	Stream               bool
 	Verbose              bool
 }
 
 func newOutputWriter(writer io.Writer, stream, verbose bool) *outputWriter {
-	return &outputWriter{writer: writer, Stream: stream, Verbose: verbose}
+	resWriter, err := os.Create("/tmp/suite.log")
+	if err != nil {
+		panic(fmt.Sprintf("Error opening result writer: %s", err))
+	}
+	return &outputWriter{writer: writer, resWriter: resWriter, Stream: stream, Verbose: verbose}
 }
 
 func (ow *outputWriter) Write(content []byte) (n int, err error) {
@@ -885,7 +891,33 @@ func (ow *outputWriter) Write(content []byte) (n int, err error) {
 	return
 }
 
+type startStruct struct {
+	Type     string
+	TestName string
+}
+
+type resultStruct struct {
+	Type     string
+	TestName string
+	Result   string
+	Duration string
+	Reason   string
+}
+
 func (ow *outputWriter) WriteCallStarted(label string, c *C) {
+	if nil != ow.resWriter {
+		var start startStruct
+		start.Type = "Start"
+		start.TestName = renderName(c)
+		b, err := json.MarshalIndent(start, "", "  ")
+		if err != nil {
+			panic("Error marshalling struct")
+		}
+		ow.m.Lock()
+		ow.resWriter.Write(b)
+		ow.resWriter.Write([]byte{'\n'})
+		ow.m.Unlock()
+	}
 	if ow.Stream {
 		header := renderCallHeader(label, c, "", "\n")
 		ow.m.Lock()
@@ -894,7 +926,35 @@ func (ow *outputWriter) WriteCallStarted(label string, c *C) {
 	}
 }
 
+func (ow *outputWriter) reportEnd(label string, c *C) {
+	var result resultStruct
+	result.Type = "End"
+	result.TestName = renderName(c)
+	result.Result = label
+	result.Duration = c.timerString()
+	if label != "PASS" {
+		bw := new(bytes.Buffer)
+		c.logb.WriteTo(bw)
+		result.Reason = string(bw.Bytes())
+
+	}
+
+	b, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		panic("Error marshalling struct")
+	}
+	ow.m.Lock()
+	ow.resWriter.Write(b)
+	ow.resWriter.Write([]byte{'\n'})
+	ow.m.Unlock()
+
+}
+
 func (ow *outputWriter) WriteCallProblem(label string, c *C) {
+	if nil != ow.resWriter {
+		ow.reportEnd(label, c)
+	}
+
 	var prefix string
 	if !ow.Stream {
 		prefix = "\n-----------------------------------" +
@@ -905,12 +965,15 @@ func (ow *outputWriter) WriteCallProblem(label string, c *C) {
 	ow.wroteCallProblemLast = true
 	ow.writer.Write([]byte(header))
 	if !ow.Stream {
-		c.logb.WriteTo(ow.writer)
+		//c.logb.WriteTo(ow.writer)
 	}
 	ow.m.Unlock()
 }
 
 func (ow *outputWriter) WriteCallSuccess(label string, c *C) {
+	if nil != ow.resWriter {
+		ow.reportEnd(label, c)
+	}
 	if ow.Stream || (ow.Verbose && c.kind == testKd) {
 		// TODO Use a buffer here.
 		var suffix string
@@ -936,6 +999,11 @@ func (ow *outputWriter) WriteCallSuccess(label string, c *C) {
 		ow.writer.Write([]byte(header))
 		ow.m.Unlock()
 	}
+}
+
+func renderName(c *C) string {
+	pc := c.method.PC()
+	return fmt.Sprintf("%s:%s", niceFuncPath(pc), niceFuncName(pc))
 }
 
 func renderCallHeader(label string, c *C, prefix, suffix string) string {
